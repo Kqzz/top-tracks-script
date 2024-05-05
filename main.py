@@ -9,6 +9,7 @@ from spotipy.oauth2 import SpotifyOAuth
 load_dotenv()
 
 LASTFM_API_KEY = os.getenv("LASTFM_KEY")
+LASTFM_USER = os.getenv("LASTFM_USER")
 
 scope = "playlist-read-private playlist-modify-private playlist-modify-public"
 sp = spotipy.Spotify(auth_manager=SpotifyOAuth(scope=scope))
@@ -49,5 +50,5 @@ def put_top_songs_into_playlist(playlist_id, last_fm_user, timeframe):
 
 weekly = os.getenv("WEEKLY_ID")
 monthly = os.getenv("MONTHLY_ID")
-put_top_songs_into_playlist(weekly, "kqzz", "7day")
-put_top_songs_into_playlist(monthly, "kqzz", "1month")
+put_top_songs_into_playlist(weekly, LASTFM_USER, "7day")
+put_top_songs_into_playlist(monthly, LASTFM_USER, "1month")
