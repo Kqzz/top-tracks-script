@@ -5,7 +5,7 @@ import spotipy
 import argparse
 import time
 from dotenv import load_dotenv
-from spotipy.oauth2 import SpotifyOAuth
+from spotipy.oauth2 import SpotifyOAuth, SpotifyOauthError
 
 # ANSI color codes for logging
 class Colors:
@@ -26,6 +26,22 @@ def log_error(message):
 
 def log_success(message):
     print(f"{Colors.GREEN}[SUCCESS]{Colors.RESET} {message}")
+
+def retry_spotify_call(func, *args, max_retries=5, **kwargs):
+    """Retry Spotify API calls with exponential backoff for OAuth errors."""
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except SpotifyOauthError as e:
+            if attempt == max_retries - 1:
+                log_error(f"Failed to execute Spotify API call after {max_retries} attempts: {str(e)}")
+                raise
+            wait_time = 2 ** attempt
+            log_warning(f"Spotify OAuth error (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s: {str(e)}")
+            time.sleep(wait_time)
+        except spotipy.SpotifyException as e:
+            # For other Spotify exceptions, don't retry - just raise immediately
+            raise
 
 # Load environment variables
 load_dotenv()
@@ -56,9 +72,9 @@ def get_top_songs(api_key, user, timeframe="7day", page=1, limit=100):
 def put_top_songs_into_playlist(playlist_id, last_fm_user, timeframe):
     log_info(f"Updating playlist {playlist_id} with top songs for {timeframe}")
     try:
-        sp.playlist_replace_items(playlist_id, [])
+        retry_spotify_call(sp.playlist_replace_items, playlist_id, [])
         log_info("Playlist cleared successfully")
-    except spotipy.SpotifyException as e:
+    except (spotipy.SpotifyException, SpotifyOauthError) as e:
         log_error(f"Failed to clear playlist: {str(e)}")
         return
 
@@ -70,18 +86,19 @@ def put_top_songs_into_playlist(playlist_id, last_fm_user, timeframe):
     added_count = 0
     for song in songs["toptracks"]["track"]:
         try:
-            results = sp.search(
+            results = retry_spotify_call(
+                sp.search,
                 q=f"track:{song.get('name')} artist:{song.get('artist').get('name')}",
                 type="track",
                 limit=1,
             )
             if results["tracks"]["items"]:
                 track_uri = results["tracks"]["items"][0]["uri"]
-                sp.playlist_add_items(playlist_id, [track_uri])
+                retry_spotify_call(sp.playlist_add_items, playlist_id, [track_uri])
                 added_count += 1
             else:
                 log_warning(f"Song not found: {song.get('name')} by {song.get('artist').get('name')}")
-        except spotipy.SpotifyException as e:
+        except (spotipy.SpotifyException, SpotifyOauthError) as e:
             log_error(f"Error adding song to playlist: {str(e)}")
 
     log_success(f"Added {added_count} songs to playlist {playlist_id}")
