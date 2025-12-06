@@ -1,63 +1,84 @@
-import json
+import argparse
 import os
+
 import requests
 import spotipy
-import argparse
-import time
 from dotenv import load_dotenv
-from spotipy.oauth2 import SpotifyOAuth, SpotifyOauthError
 
-# ANSI color codes for logging
-class Colors:
-    RESET = "\033[0m"
-    RED = "\033[91m"
-    GREEN = "\033[92m"
-    YELLOW = "\033[93m"
-    BLUE = "\033[94m"
-
-def log_info(message):
-    print(f"{Colors.BLUE}[INFO]{Colors.RESET} {message}")
-
-def log_warning(message):
-    print(f"{Colors.YELLOW}[WARNING]{Colors.RESET} {message}")
-
-def log_error(message):
-    print(f"{Colors.RED}[ERROR]{Colors.RESET} {message}")
-
-def log_success(message):
-    print(f"{Colors.GREEN}[SUCCESS]{Colors.RESET} {message}")
-
-def retry_spotify_call(func, *args, max_retries=5, **kwargs):
-    """Retry Spotify API calls with exponential backoff for OAuth errors."""
-    for attempt in range(max_retries):
-        try:
-            return func(*args, **kwargs)
-        except SpotifyOauthError as e:
-            if attempt == max_retries - 1:
-                log_error(f"Failed to execute Spotify API call after {max_retries} attempts: {str(e)}")
-                raise
-            wait_time = 2 ** attempt
-            log_warning(f"Spotify OAuth error (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s: {str(e)}")
-            time.sleep(wait_time)
-        except spotipy.SpotifyException as e:
-            # For other Spotify exceptions, don't retry - just raise immediately
-            raise
+from chosic_api import ChosicClient
+from logging_config import LogLevel, log
+from recommendation_logic import aggregate_recommendations, split_into_groups
+from spotify_utils import (
+    get_spotify_client,
+    get_top_n_tracks,
+    move_tracks_to_top_of_playlist,
+    replace_playlist,
+)
 
 # Load environment variables
 load_dotenv()
-LASTFM_API_KEY = os.getenv("LASTFM_KEY")
-LASTFM_USER = os.getenv("LASTFM_USER")
 WEEKLY_ID = os.getenv("WEEKLY_ID")
 MONTHLY_ID = os.getenv("MONTHLY_ID")
+RECOMMENDED_ID = os.getenv("RECOMMENDED_ID")
+ARCHIVE_ID = os.getenv("ARCHIVE_ID")
+LASTFM_API_KEY = os.getenv("LASTFM_KEY")
+LASTFM_USER = os.getenv("LASTFM_USER")
 
-# Spotify authentication
-SCOPE = "playlist-read-private playlist-modify-private playlist-modify-public"
-try:
-    sp = spotipy.Spotify(auth_manager=SpotifyOAuth(scope=SCOPE))
-    log_info("Successfully authenticated with Spotify")
-except Exception as e:
-    log_error(f"Failed to authenticate with Spotify: {str(e)}")
-    exit(1)
+RECS_PER_GROUP = 30
+GROUP_SIZE = 5
+FINAL_LIMIT = 30
+
+
+def generate_advanced_recommendations():
+    if not all([WEEKLY_ID, MONTHLY_ID, RECOMMENDED_ID, ARCHIVE_ID]):
+        log(
+            "Missing WEEKLY_ID, MONTHLY_ID, RECOMMENDED_ID, or ARCHIVE_ID in environment variables.",
+            LogLevel.INFO,
+        )
+        return
+
+    log("Fetching top tracks from playlists...", LogLevel.INFO)
+    weekly_tracks = get_top_n_tracks(WEEKLY_ID, 10)
+    monthly_tracks = get_top_n_tracks(MONTHLY_ID, 10)
+
+    groups = split_into_groups(weekly_tracks, GROUP_SIZE) + split_into_groups(
+        monthly_tracks, GROUP_SIZE
+    )
+    log(f"Formed {len(groups)} groups of {GROUP_SIZE} tracks each.", LogLevel.INFO)
+
+    chosic = ChosicClient()
+    chosic.initialize()
+
+    group_recs = []
+    for idx, group in enumerate(groups):
+        log(f"Getting recommendations for group {idx + 1}: {group}", LogLevel.DEBUG)
+        recs = chosic.get_recommendations(group, limit=RECS_PER_GROUP)
+        group_recs.append([track["id"] for track in recs])
+        log(
+            f"Group {idx + 1} recommendations: {[track['id'] for track in recs]}",
+            LogLevel.DEBUG,
+        )
+
+    # Exclude any tracks that are in the original weekly or monthly playlists
+    exclude_ids = set(weekly_tracks + monthly_tracks)
+
+    final_recs = aggregate_recommendations(
+        group_recs, final_limit=FINAL_LIMIT, exclude_ids=exclude_ids
+    )
+    log(f"Final recommendations: {final_recs}", LogLevel.INFO)
+
+    # Archive old recommendations before replacing
+    old_recs = get_top_n_tracks(RECOMMENDED_ID, 100)
+    if old_recs:
+        move_tracks_to_top_of_playlist(ARCHIVE_ID, old_recs)
+        log(
+            f"Archived {len(old_recs)} old recommendations to archive playlist.",
+            LogLevel.INFO,
+        )
+
+    replace_playlist(RECOMMENDED_ID, final_recs)
+    log(f"Updated recommended playlist with {len(final_recs)} tracks.", LogLevel.INFO)
+
 
 def get_top_songs(api_key, user, timeframe="7day", page=1, limit=100):
     url = f"http://ws.audioscrobbler.com/2.0/?method=user.gettoptracks&user={user}&api_key={api_key}&period={timeframe}&page={page}&limit={limit}&format=json"
@@ -66,64 +87,83 @@ def get_top_songs(api_key, user, timeframe="7day", page=1, limit=100):
         response.raise_for_status()
         return response.json()
     except requests.RequestException as e:
-        log_error(f"Failed to fetch top songs: {str(e)}")
+        log(f"Failed to fetch top songs: {str(e)}", LogLevel.INFO)
         return None
 
+
 def put_top_songs_into_playlist(playlist_id, last_fm_user, timeframe):
-    log_info(f"Updating playlist {playlist_id} with top songs for {timeframe}")
+    log(
+        f"Updating playlist {playlist_id} with top songs for {timeframe}", LogLevel.INFO
+    )
+    sp = get_spotify_client()
     try:
-        retry_spotify_call(sp.playlist_replace_items, playlist_id, [])
-        log_info("Playlist cleared successfully")
-    except (spotipy.SpotifyException, SpotifyOauthError) as e:
-        log_error(f"Failed to clear playlist: {str(e)}")
+        sp.playlist_replace_items(playlist_id, [])
+        log("Playlist cleared successfully", LogLevel.INFO)
+    except (spotipy.SpotifyException, Exception) as e:
+        log(f"Failed to clear playlist: {str(e)}", LogLevel.INFO)
         return
-
-    songs = get_top_songs(LASTFM_API_KEY, last_fm_user, timeframe=timeframe, page=1, limit=50)
+    songs = get_top_songs(
+        LASTFM_API_KEY, last_fm_user, timeframe=timeframe, page=1, limit=50
+    )
     if not songs:
-        log_error("Failed to fetch top songs")
+        log("Failed to fetch top songs", LogLevel.INFO)
         return
-
     added_count = 0
     for song in songs["toptracks"]["track"]:
         try:
-            results = retry_spotify_call(
-                sp.search,
+            results = sp.search(
                 q=f"track:{song.get('name')} artist:{song.get('artist').get('name')}",
                 type="track",
                 limit=1,
             )
             if results["tracks"]["items"]:
                 track_uri = results["tracks"]["items"][0]["uri"]
-                retry_spotify_call(sp.playlist_add_items, playlist_id, [track_uri])
+                sp.playlist_add_items(playlist_id, [track_uri])
                 added_count += 1
             else:
-                log_warning(f"Song not found: {song.get('name')} by {song.get('artist').get('name')}")
-        except (spotipy.SpotifyException, SpotifyOauthError) as e:
-            log_error(f"Error adding song to playlist: {str(e)}")
+                log(
+                    f"Song not found: {song.get('name')} by {song.get('artist').get('name')}",
+                    LogLevel.INFO,
+                )
+        except (spotipy.SpotifyException, Exception) as e:
+            log(f"Error adding song to playlist: {str(e)}", LogLevel.INFO)
+    log(f"Added {added_count} songs to playlist {playlist_id}", LogLevel.INFO)
 
-    log_success(f"Added {added_count} songs to playlist {playlist_id}")
 
 def update_playlists():
     if not all([LASTFM_API_KEY, LASTFM_USER, WEEKLY_ID, MONTHLY_ID]):
-        log_error("Missing required environment variables")
+        log(
+            "Missing required environment variables for Last.fm playlist update.",
+            LogLevel.INFO,
+        )
         return
-
     put_top_songs_into_playlist(WEEKLY_ID, LASTFM_USER, "7day")
     put_top_songs_into_playlist(MONTHLY_ID, LASTFM_USER, "1month")
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Update Spotify playlists with Last.fm top tracks")
-    parser.add_argument("--loop", type=int, help="Run the script in a loop with specified minutes between iterations")
+    parser = argparse.ArgumentParser(
+        description="Update Spotify playlists or generate advanced recommendations."
+    )
+    parser.add_argument(
+        "--recommend",
+        action="store_true",
+        help="Generate a recommended playlist from weekly and monthly playlists (advanced mode)",
+    )
+    parser.add_argument(
+        "--top-songs",
+        action="store_true",
+        help="Update weekly and monthly playlists with Last.fm top tracks",
+    )
     args = parser.parse_args()
 
-    if args.loop:
-        log_info(f"Running in loop mode with {args.loop} minutes interval")
-        while True:
-            update_playlists()
-            log_info(f"Sleeping for {args.loop} minutes")
-            time.sleep(args.loop * 60)
-    else:
+    if args.top_songs:
         update_playlists()
+    if args.recommend:
+        generate_advanced_recommendations()
+    if not args.recommend and not args.top_songs:
+        print("Please specify --recommend, --top-songs, or both.")
+
 
 if __name__ == "__main__":
     main()

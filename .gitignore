@@ -1,3 +1,4 @@
 .cache
 .env
 __pycache__/
+.chosic_session.json
